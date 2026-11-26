@@ -28,6 +28,7 @@ export const EvaluateView = {
     </div>
     <div class="panel span-7">
       <h2>正式规则板</h2>
+      <p class="hint">求值只读正式规则；版本应与发布册/对比矩阵同源。</p>
       <table v-if="board">
         <thead><tr><th>开关</th><th>环境</th><th>类型</th><th>%</th><th>版本</th></tr></thead>
         <tbody>

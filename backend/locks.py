@@ -1,4 +1,10 @@
-"""行锁与争用痕（嵌进发布/熔断主写路径）。"""
+"""行锁与争用痕（嵌进发布/熔断/爬坡主写路径）。
+
+争用段只负责「谁抢到同一把锁、输家留痕」，不含任何步长/取舍口径；
+取舍口径见 step_policy.py，两段物理分开。
+
+锁行必须即时提交，跨连接才看得见：否则两个写者会各自读到空表而双成。
+"""
 from __future__ import annotations
 
 import time
@@ -13,20 +19,26 @@ TTL = 20.0
 
 
 def acquire(conn, key: str, holder: str) -> None:
+    """原子抢占：条件 UPSERT + RETURNING，未抢到只落争用痕并抛 409。"""
     now = time.time()
-    row = conn.execute("SELECT * FROM row_locks WHERE lock_key=?", (key,)).fetchone()
-    if row and row["expires_at"] > now and row["holder"] != holder:
+    row = conn.execute(
+        "INSERT INTO row_locks(lock_key, holder, expires_at) VALUES(?,?,?) "
+        "ON CONFLICT(lock_key) DO UPDATE SET holder=excluded.holder, expires_at=excluded.expires_at "
+        "WHERE row_locks.expires_at <= ? OR row_locks.holder = excluded.holder "
+        "RETURNING holder",
+        (key, holder, now + TTL, now),
+    ).fetchone()
+    if not row:
+        winner = conn.execute(
+            "SELECT holder FROM row_locks WHERE lock_key=?", (key,)
+        ).fetchone()
         conn.execute(
             "INSERT INTO contention_marks(lock_key, loser, winner, created_at) VALUES(?,?,?,?)",
-            (key, holder, row["holder"], now),
+            (key, holder, winner["holder"] if winner else "", now),
         )
         conn.commit()
-        raise HTTPException(409, detail="发布锁争用，请稍后重试")
-    conn.execute(
-        "INSERT INTO row_locks(lock_key, holder, expires_at) VALUES(?,?,?) "
-        "ON CONFLICT(lock_key) DO UPDATE SET holder=excluded.holder, expires_at=excluded.expires_at",
-        (key, holder, now + TTL),
-    )
+        raise HTTPException(409, detail="同一开关上的写锁争用，请稍后重试")
+    conn.commit()
 
 
 def release(conn, key: str, holder: str) -> None:

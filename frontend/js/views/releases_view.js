@@ -47,6 +47,7 @@ export const ReleasesView = {
     </div>
     <div class="panel span-7">
       <h2>正式发布</h2>
+      <p class="hint">爬坡步进与手发均按版本落册；正式版本须与正式规则同源。</p>
       <table><thead><tr><th>开关</th><th>环境</th><th>版本</th><th>说明</th></tr></thead>
       <tbody>
         <tr v-for="r in official" :key="r.id">

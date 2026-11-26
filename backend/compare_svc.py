@@ -52,11 +52,14 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
             ).fetchall()
         ]
     diffs = []
-    if official and release_shadows:
-        sh = release_shadows[0]
+    pending = (rule_shadows or []) + (release_shadows or [])
+    if pending:
+        sh = pending[0]
         for field in ("kind", "percent", "cohort_id"):
-            if official[field] != sh.get(field):
-                diffs.append({"field": field, "official": official[field], "shadow": sh.get(field)})
+            official_val = official[field] if official else None
+            if official_val != sh.get(field):
+                diffs.append({"field": field, "official": official_val, "shadow": sh.get(field)})
+    aligned = not diffs
     return {
         "flag": dict(fl),
         "env": dict(env),
@@ -66,6 +69,7 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
         "open_kill_shadows": kill_shadows,
         "recent_releases": recent_releases,
         "diffs": diffs,
+        "aligned": aligned,
         "has_pending_shadow": bool(rule_shadows or release_shadows or kill_shadows),
     }
 
@@ -80,20 +84,29 @@ def compare_matrix(authorization: str | None = Header(default=None)):
             (r["flag_id"], r["env_id"]): dict(r)
             for r in conn.execute("SELECT * FROM flag_rules WHERE official=1").fetchall()
         }
+        pending: dict[tuple[int, int], list[dict]] = {}
+        for table in ("rule_shadows", "release_shadows"):
+            for r in conn.execute(
+                f"SELECT * FROM {table} WHERE status='open' ORDER BY id DESC"
+            ).fetchall():
+                pending.setdefault((r["flag_id"], r["env_id"]), []).append(dict(r))
         matrix = []
         for f in flags:
             row = {"flag_id": f["id"], "flag_key": f["key"], "status": f["status"], "cells": []}
             for e in envs:
                 rule = rules.get((f["id"], e["id"]))
-                row["cells"].append(
-                    {
-                        "env_id": e["id"],
-                        "env_code": e["code"],
-                        "has_rule": rule is not None,
-                        "percent": rule["percent"] if rule else None,
-                        "version": rule["version"] if rule else None,
-                        "kind": rule["kind"] if rule else None,
-                    }
-                )
+                drafts = pending.get((f["id"], e["id"]), [])
+                cell = {
+                    "env_id": e["id"],
+                    "env_code": e["code"],
+                    "has_rule": rule is not None,
+                    "percent": rule["percent"] if rule else None,
+                    "version": rule["version"] if rule else None,
+                    "kind": rule["kind"] if rule else None,
+                    "has_pending_shadow": bool(drafts),
+                    "pending_percent": drafts[0]["percent"] if drafts else None,
+                    "aligned": not drafts,
+                }
+                row["cells"].append(cell)
             matrix.append(row)
     return {"envs": envs, "matrix": matrix}

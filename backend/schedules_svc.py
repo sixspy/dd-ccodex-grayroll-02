@@ -9,6 +9,9 @@ from pydantic import BaseModel
 from audit_svc import write_audit, write_history
 from auth import current_user, require_writer
 from db import connect
+from locks import acquire, release
+from policies import describe_path
+from step_policy import assert_ramp_ledger, evaluate_step
 from validators import require_int, require_percent, require_str
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
@@ -93,7 +96,12 @@ def cancel_schedule(schedule_id: int, authorization: str | None = Header(default
 
 @router.post("/{schedule_id}/apply-next")
 def apply_next(schedule_id: int, authorization: str | None = Header(default=None)):
-    """手动推进到下一步：写入正式百分比（演示用，真实 cron 为空桩外的旁路）。"""
+    """推进到下一步：甲路径同事务写正式规则 + 发布册。
+
+    - 争用段：以「同一开关上的爬坡互斥」为锁键，输家只落争用痕（409）。
+    - 取舍段：单步增量 > 20 整笔拒写，正式规则册零增，不落影子草案。
+    - 联检段：正式规则与发布册版本须同事务对齐（跨表账实）。
+    """
     import json as _json
 
     user = current_user(authorization)
@@ -102,46 +110,91 @@ def apply_next(schedule_id: int, authorization: str | None = Header(default=None
         row = conn.execute("SELECT * FROM rollout_schedules WHERE id=?", (schedule_id,)).fetchone()
         if not row or row["status"] not in ("planned", "running"):
             raise HTTPException(400, detail="调度不可推进")
-        try:
-            steps = _json.loads(row["steps_json"])
-        except Exception as e:
-            raise HTTPException(400, detail="步骤 JSON 无效") from e
-        idx = int(row["cursor_step"] or 0)
-        if idx >= len(steps):
-            raise HTTPException(400, detail="已无下一步")
-        step = steps[idx]
-        pct = require_percent(step.get("percent", 0))
         fid, eid = row["flag_id"], row["env_id"]
-        now = time.time()
-        old = conn.execute(
-            "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1", (fid, eid)
-        ).fetchone()
-        ver = (old["version"] + 1) if old else 1
-        if old:
-            conn.execute("DELETE FROM flag_rules WHERE id=?", (old["id"],))
-        conn.execute(
-            "INSERT INTO flag_rules(flag_id, env_id, kind, percent, cohort_id, version, official, updated_at) "
-            "VALUES(?,?,?,?,NULL,?,1,?)",
-            (fid, eid, "percent", pct, ver, now),
-        )
-        conn.execute(
-            "UPDATE flags SET status='active' WHERE id=? AND status IN ('draft','killed','active')",
-            (fid,),
-        )
-        new_idx = idx + 1
-        status = "done" if new_idx >= len(steps) else "running"
-        conn.execute(
-            "UPDATE rollout_schedules SET cursor_step=?, status=? WHERE id=?",
-            (new_idx, status, schedule_id),
-        )
-        write_history(
-            conn,
-            user["username"],
-            "schedule_step",
-            f"推进到 {pct}%",
-            flag_id=fid,
-            env_id=eid,
-        )
-        write_audit(conn, user["username"], "schedule_step", "schedule", schedule_id, f"percent={pct}")
-        conn.commit()
-    return {"id": schedule_id, "applied_percent": pct, "status": status, "cursor_step": new_idx}
+        key = f"flag-ramp:{fid}"
+        acquire(conn, key, user["username"])
+        held = True
+        try:
+            # 抢到锁后再读一次，避免拿旧游标重复推进。
+            row = conn.execute("SELECT * FROM rollout_schedules WHERE id=?", (schedule_id,)).fetchone()
+            if not row or row["status"] not in ("planned", "running"):
+                raise HTTPException(400, detail="调度不可推进")
+            try:
+                steps = _json.loads(row["steps_json"])
+            except Exception as e:
+                raise HTTPException(400, detail="步骤 JSON 无效") from e
+            idx = int(row["cursor_step"] or 0)
+            if idx >= len(steps):
+                raise HTTPException(400, detail="已无下一步")
+            step = steps[idx]
+            pct = require_percent(step.get("percent", 0))
+
+            now = time.time()
+            old = conn.execute(
+                "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1", (fid, eid)
+            ).fetchone()
+            baseline = int(old["percent"]) if old else 0
+            verdict = evaluate_step(baseline, pct)
+
+            ver = (old["version"] + 1) if old else 1
+            if old:
+                conn.execute("DELETE FROM flag_rules WHERE id=?", (old["id"],))
+            conn.execute(
+                "INSERT INTO flag_rules(flag_id, env_id, kind, percent, cohort_id, version, official, updated_at) "
+                "VALUES(?,?,?,?,NULL,?,1,?)",
+                (fid, eid, "percent", pct, ver, now),
+            )
+            conn.execute(
+                "INSERT INTO releases(flag_id, env_id, version, summary, status, official, published_at, published_by) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (fid, eid, ver, f"爬坡步进 {baseline}% -> {pct}%", "published", 1, now, user["username"]),
+            )
+            conn.execute(
+                "UPDATE flags SET status='active' WHERE id=? AND status IN ('draft','killed','active')",
+                (fid,),
+            )
+            new_idx = idx + 1
+            status = "done" if new_idx >= len(steps) else "running"
+            conn.execute(
+                "UPDATE rollout_schedules SET cursor_step=?, status=? WHERE id=?",
+                (new_idx, status, schedule_id),
+            )
+            assert_ramp_ledger(conn, fid, eid, ver)
+            write_history(
+                conn,
+                user["username"],
+                "schedule_step",
+                f"推进到 {pct}%（{baseline}% -> {pct}%）",
+                flag_id=fid,
+                env_id=eid,
+            )
+            write_audit(
+                conn,
+                user["username"],
+                "schedule_step",
+                "schedule",
+                schedule_id,
+                f"percent={pct} delta={verdict['delta']} path={describe_path('ramp', False)}",
+            )
+            conn.commit()
+            held = False
+        except Exception:
+            # 取舍/联检失败即整笔回滚，正式规则册保持零增；再释放锁并提交解锁。
+            conn.rollback()
+            release(conn, key, user["username"])
+            conn.commit()
+            held = False
+            raise
+        finally:
+            if held:
+                release(conn, key, user["username"])
+                conn.commit()
+    return {
+        "id": schedule_id,
+        "applied_percent": pct,
+        "baseline_percent": verdict["baseline_percent"],
+        "delta": verdict["delta"],
+        "status": status,
+        "cursor_step": new_idx,
+        "version": ver,
+    }
